@@ -53,7 +53,8 @@ const initialData = {
       createdAt: new Date().toISOString(),
       resolvedAt: null
     }
-  ]
+  ],
+  reworkOrders: []
 };
 
 const routes = [
@@ -67,7 +68,11 @@ const routes = [
   "PATCH /sections/:id/check",
   "GET /issues",
   "POST /issues",
-  "PATCH /issues/:id/status"
+  "PATCH /issues/:id/status",
+  "GET /rework-orders",
+  "POST /rework-orders",
+  "PATCH /rework-orders/:id/review",
+  "POST /rework-orders/archive"
 ];
 
 async function ensureDb() {
@@ -81,7 +86,9 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const db = JSON.parse(await readFile(DB_FILE, "utf8"));
+  db.reworkOrders = Array.isArray(db.reworkOrders) ? db.reworkOrders : [];
+  return db;
 }
 
 async function writeDb(data) {
@@ -140,6 +147,7 @@ function buildProgress(db, tuneId) {
   const issues = db.issues.filter((item) => item.tuneId === tuneId);
   const checkedCount = sections.filter((item) => item.checked).length;
   const openIssues = issues.filter((item) => item.status !== "resolved").length;
+  const reworkOrders = (db.reworkOrders || []).filter((item) => item.tuneId === tuneId);
   return {
     tuneId,
     totalSections: sections.length,
@@ -147,7 +155,15 @@ function buildProgress(db, tuneId) {
     uncheckedSections: sections.length - checkedCount,
     openIssues,
     resolvedIssues: issues.length - openIssues,
-    percent: sections.length ? Math.round((checkedCount / sections.length) * 100) : 0
+    percent: sections.length ? Math.round((checkedCount / sections.length) * 100) : 0,
+    rework: {
+      total: reworkOrders.length,
+      pendingReview: reworkOrders.filter((item) => item.status === "pending_review").length,
+      approved: reworkOrders.filter((item) => item.status === "approved" && !item.invalidated).length,
+      invalidated: reworkOrders.filter((item) => item.status === "approved" && item.invalidated).length,
+      rejected: reworkOrders.filter((item) => item.status === "rejected").length,
+      archived: reworkOrders.filter((item) => item.status === "archived").length
+    }
   };
 }
 
@@ -254,6 +270,12 @@ async function handle(req, res) {
       resolvedAt: null
     };
     db.issues.push(issue);
+    // 新问题让同曲目已通过但未归档的返工单失效，须重新复核
+    db.reworkOrders
+      .filter((item) => item.tuneId === issue.tuneId && item.status === "approved")
+      .forEach((item) => {
+        item.invalidated = true;
+      });
     await writeDb(db);
     return send(res, 201, { data: issue });
   }
@@ -269,6 +291,115 @@ async function handle(req, res) {
     issue.note = body.note ?? issue.note;
     await writeDb(db);
     return send(res, 200, { data: issue });
+  }
+
+  if (req.method === "GET" && pathname === "/rework-orders") {
+    const tuneId = searchParams.get("tuneId");
+    const status = searchParams.get("status");
+    const orders = db.reworkOrders.filter(
+      (item) => (!tuneId || item.tuneId === tuneId) && (!status || item.status === status)
+    );
+    return send(res, 200, { data: orders });
+  }
+
+  if (req.method === "POST" && pathname === "/rework-orders") {
+    const body = await parseBody(req);
+    required(body, ["tuneId", "issueIds"]);
+    findTune(db, body.tuneId);
+    if (!Array.isArray(body.issueIds) || body.issueIds.length === 0) {
+      return send(res, 400, { error: "issueIds必须是非空数组，整单拒绝" });
+    }
+    const issueIds = [...new Set(body.issueIds)];
+    const issues = issueIds.map((id) => db.issues.find((item) => item.id === id));
+    if (issues.some((item) => !item || item.tuneId !== body.tuneId)) {
+      return send(res, 400, { error: "问题不存在或不属于该曲目，整单拒绝" });
+    }
+    if (new Set(issues.map((item) => item.sectionId)).size > 1) {
+      return send(res, 400, { error: "返工单不能跨区间，整单拒绝" });
+    }
+    if (issues.some((item) => item.status === "resolved")) {
+      return send(res, 400, { error: "问题已结案，整单拒绝" });
+    }
+    const pendingIssueIds = new Set(
+      db.reworkOrders.filter((item) => item.status === "pending_review").flatMap((item) => item.issueIds)
+    );
+    if (issueIds.some((id) => pendingIssueIds.has(id))) {
+      return send(res, 409, { error: "同一问题只允许一张待复核返工单，整单拒绝" });
+    }
+    const now = new Date().toISOString();
+    const order = {
+      id: makeId("rework"),
+      tuneId: body.tuneId,
+      sectionId: issues[0].sectionId,
+      issueIds,
+      status: "pending_review",
+      invalidated: false,
+      reason: null,
+      note: body.note || "",
+      createdAt: now,
+      reviewedAt: null,
+      archivedAt: null
+    };
+    db.reworkOrders.push(order);
+    // 返工后问题仍计未解决，所属区间转为待校对
+    const section = db.sections.find((item) => item.id === order.sectionId);
+    if (section) section.checked = false;
+    await writeDb(db);
+    return send(res, 201, { data: order });
+  }
+
+  if (req.method === "POST" && pathname === "/rework-orders/archive") {
+    const body = await parseBody(req);
+    // 批量归档只处理已复核且未失效的记录
+    let targets = db.reworkOrders.filter((item) => item.status === "approved" && !item.invalidated);
+    if (body.tuneId) targets = targets.filter((item) => item.tuneId === body.tuneId);
+    if (Array.isArray(body.ids) && body.ids.length) {
+      targets = targets.filter((item) => body.ids.includes(item.id));
+    }
+    const now = new Date().toISOString();
+    targets.forEach((item) => {
+      item.status = "archived";
+      item.archivedAt = now;
+    });
+    await writeDb(db);
+    return send(res, 200, { data: targets, archivedCount: targets.length });
+  }
+
+  const reviewMatch = pathname.match(/^\/rework-orders\/([^/]+)\/review$/);
+  if (reviewMatch && req.method === "PATCH") {
+    const order = db.reworkOrders.find((item) => item.id === reviewMatch[1]);
+    if (!order) return send(res, 404, { error: "返工单不存在" });
+    const reviewable = order.status === "pending_review" || (order.status === "approved" && order.invalidated);
+    if (!reviewable) {
+      return send(res, 409, { error: "返工单当前状态不能复核" });
+    }
+    const body = await parseBody(req);
+    required(body, ["result"]);
+    const now = new Date().toISOString();
+    if (body.result === "approve") {
+      order.status = "approved";
+      order.invalidated = false;
+      order.reason = null;
+      order.reviewedAt = now;
+      // 复核通过才结案
+      order.issueIds.forEach((id) => {
+        const issue = db.issues.find((item) => item.id === id);
+        if (issue) {
+          issue.status = "resolved";
+          issue.resolvedAt = now;
+        }
+      });
+    } else if (body.result === "reject") {
+      required(body, ["reason"]);
+      order.status = "rejected";
+      order.reason = body.reason;
+      order.reviewedAt = now;
+      // 退回保持原状态：问题与区间维持不变
+    } else {
+      return send(res, 400, { error: "result必须是approve或reject" });
+    }
+    await writeDb(db);
+    return send(res, 200, { data: order });
   }
 
   return send(res, 404, { error: "接口不存在", routes });
